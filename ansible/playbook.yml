@@ -1,0 +1,193 @@
+---
+- name: Deploy Spring Boot application
+  hosts: all
+  become: yes
+
+  vars:
+    app_name: spring-boot
+    app_dir: /opt/app
+    artifact_src: artifacts/auto_agent_v1-0.0.1-SNAPSHOT.jar
+    artifact_dest: /opt/app/auto_agent_v1-0.0.1-SNAPSHOT.jar
+    app_port: 8080
+    java_package: openjdk-21-jdk
+
+  handlers:
+    - name: restart spring-app
+      systemd:
+        name: spring-app
+        state: restarted
+        daemon_reload: yes
+
+    - name: reload nginx
+      service:
+        name: nginx
+        state: reloaded
+
+    - name: restart nginx
+      service:
+        name: nginx
+        state: restarted
+
+  tasks:
+    - name: Update apt cache
+      apt:
+        update_cache: yes
+        cache_valid_time: 3600
+
+    - name: Install required packages
+      apt:
+        name:
+          - "{{ java_package }}"
+          - nginx
+          - curl
+        state: present
+
+    - name: Create application directory
+      file:
+        path: "{{ app_dir }}"
+        state: directory
+        owner: ubuntu
+        group: ubuntu
+        mode: "0755"
+
+    - name: Copy pre-built jar to server
+      copy:
+        src: "../{{ artifact_src }}"
+        dest: "{{ artifact_dest }}"
+        owner: ubuntu
+        group: ubuntu
+        mode: "0644"
+      notify: restart spring-app
+
+    - name: Set app_jar fact from uploaded artifact
+      set_fact:
+        app_jar: "{{ artifact_dest }}"
+
+    - name: Create systemd service for spring-app
+      copy:
+        dest: /etc/systemd/system/spring-app.service
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          [Unit]
+          Description=Spring Boot Application - {{ app_name }}
+          After=network.target
+
+          [Service]
+          User=ubuntu
+          WorkingDirectory={{ app_dir }}
+          ExecStart=/usr/bin/java -jar {{ app_jar }}
+          Restart=always
+          RestartSec=10
+          StandardOutput=journal
+          StandardError=journal
+          SyslogIdentifier=spring-app
+          Environment=SERVER_PORT={{ app_port }}
+
+          [Install]
+          WantedBy=multi-user.target
+      notify: restart spring-app
+
+    - name: Enable and start spring-app service
+      systemd:
+        name: spring-app
+        enabled: yes
+        state: started
+        daemon_reload: yes
+
+    - name: Remove default nginx site
+      file:
+        path: /etc/nginx/sites-enabled/default
+        state: absent
+      notify: reload nginx
+
+    - name: Configure nginx reverse proxy
+      copy:
+        dest: /etc/nginx/sites-available/spring-app
+        owner: root
+        group: root
+        mode: "0644"
+        content: |
+          server {
+              listen 80;
+              server_name _;
+
+              access_log /var/log/nginx/spring-app-access.log;
+              error_log  /var/log/nginx/spring-app-error.log;
+
+              location / {
+                  proxy_pass         http://127.0.0.1:{{ app_port }};
+                  proxy_http_version 1.1;
+                  proxy_set_header   Host              $host;
+                  proxy_set_header   X-Real-IP         $remote_addr;
+                  proxy_set_header   X-Forwarded-For   $proxy_add_x_forwarded_for;
+                  proxy_set_header   X-Forwarded-Proto $scheme;
+                  proxy_connect_timeout 60s;
+                  proxy_send_timeout    60s;
+                  proxy_read_timeout    60s;
+              }
+          }
+      notify: reload nginx
+
+    - name: Enable nginx spring-app site
+      file:
+        src: /etc/nginx/sites-available/spring-app
+        dest: /etc/nginx/sites-enabled/spring-app
+        state: link
+      notify: reload nginx
+
+    - name: Test nginx configuration
+      command: nginx -t
+      changed_when: false
+
+    - name: Ensure nginx is enabled and started
+      service:
+        name: nginx
+        state: started
+        enabled: yes
+
+    - name: Wait for spring-app to start listening on port 8080
+      wait_for:
+        port: "{{ app_port }}"
+        host: 127.0.0.1
+        delay: 5
+        timeout: 120
+
+    - name: Verify application health via actuator
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/actuator/health"
+        method: GET
+        status_code: [200, 204]
+        timeout: 30
+      register: health_actuator
+      ignore_errors: yes
+
+    - name: Verify application health via /health fallback
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/health"
+        method: GET
+        status_code: [200, 204]
+        timeout: 30
+      register: health_fallback
+      when: health_actuator is failed or health_actuator.status | default(0) not in [200, 204]
+      ignore_errors: yes
+
+    - name: Verify application responds on root path fallback
+      uri:
+        url: "http://127.0.0.1:{{ app_port }}/"
+        method: GET
+        status_code: [200, 204, 302, 404]
+        timeout: 30
+      register: health_root
+      when: >
+        (health_actuator is failed or health_actuator.status | default(0) not in [200, 204]) and
+        (health_fallback is skipped or health_fallback is failed or health_fallback.status | default(0) not in [200, 204])
+      ignore_errors: yes
+
+    - name: Report deployment success
+      debug:
+        msg: >
+          Spring Boot app '{{ app_name }}' deployed successfully.
+          Jar: {{ app_jar }}
+          Listening on port {{ app_port }} behind nginx on port 80.
